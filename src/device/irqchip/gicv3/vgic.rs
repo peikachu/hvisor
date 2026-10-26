@@ -291,9 +291,9 @@ pub fn vgicv3_redist_handler(mmio: &mut MMIOAccess, cpu: usize) -> HvResult {
                         return HvResult::Ok(());
                     }
                     if mmio.is_write {
-                        let mut reg = PendingR0(mmio.value as u32);
+                        let mut reg = PendingR0::from_raw(mmio.value as u32);
                         let sgis = reg.sgis();
-                        for irq_id in 0..super::SGIS_NUM {
+                        for irq_id in 0..crate::device::irqchip::SGIS_NUM {
                             if !sgis.get_bit(irq_id) {
                                 continue;
                             }
@@ -305,18 +305,21 @@ pub fn vgicv3_redist_handler(mmio: &mut MMIOAccess, cpu: usize) -> HvResult {
                         }
                         // Preserve physical PPI writes in bits 16..31 only.
                         reg.set_sgis(0);
-                        mmio.value = reg.0 as usize;
+                        mmio.value = reg.raw() as usize;
                         mmio_perform_access(gicr_base, mmio);
                     } else {
                         mmio_perform_access(gicr_base, mmio);
-                        let mut sgis =
-                            get_cpu_data(cpu).vcpu.irq.pending_mask(0, super::SGIS_NUM) as u32;
+                        let mut sgis = get_cpu_data(cpu)
+                            .vcpu
+                            .irq
+                            .pending_mask(0, crate::device::irqchip::SGIS_NUM)
+                            as u32;
                         if cpu == crate::arch::cpu::this_cpu_id() {
                             sgis |= super::lr_pending_sgi_mask();
                         }
-                        let mut reg = PendingR0(mmio.value as u32);
+                        let mut reg = PendingR0::from_raw(mmio.value as u32);
                         reg.set_sgis(sgis as u16);
-                        mmio.value = reg.0 as usize;
+                        mmio.value = reg.raw() as usize;
                     }
                     return HvResult::Ok(());
                 }

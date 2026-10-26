@@ -40,6 +40,7 @@ use crate::arch::zone::GicConfig;
 use crate::config::root_zone_config;
 use crate::consts::{self, MAX_CPU_NUM};
 use crate::cpu_data::this_cpu_data;
+use crate::device::irqchip::SGIS_NUM;
 
 use crate::device::irqchip::gicv3::gits::gits_reset;
 use crate::event::{check_events, dispatch_host_events};
@@ -74,8 +75,7 @@ pub fn gicc_init() {
 
 fn gicv3_clear_pending_irqs() {
     let vtr = read_sysreg!(ich_vtr_el2) as usize;
-    let lr_num: usize = (vtr & 0xf) + 1;
-    for i in 0..lr_num {
+    for i in 0..list_regs_num() {
         write_lr(i, 0) //clear lr
     }
     let num_priority_bits = (vtr >> 29) + 1;
@@ -159,8 +159,6 @@ pub fn gicv3_handle_irq_el1() {
     trace!("handle done")
 }
 
-pub(crate) const SGIS_NUM: usize = 16;
-
 /// An ICH_LR<n>_EL2 value.
 #[derive(Clone, Copy)]
 struct IchLr(u64);
@@ -199,8 +197,11 @@ impl IchLr {
     }
 }
 
+/// Number of implemented List registers; ICH_VTR_EL2.ListRegs[4:0] holds
+/// that number minus one. GICv3 defines at most 16 (`ICH_LR0..15_EL2`),
+/// which is also all `read_lr()`/`write_lr()` can reach.
 fn list_regs_num() -> usize {
-    read_sysreg!(ich_vtr_el2).get_bits(0..5) as usize + 1
+    (read_sysreg!(ich_vtr_el2).get_bits(0..5) as usize + 1).min(16)
 }
 
 pub fn clear_guest_sgi(target_cpu: usize, irq_id: usize) -> bool {
@@ -454,8 +455,7 @@ pub fn inject_irq(irq_id: usize, is_hardware: bool) -> bool {
     const LR_VIRTIRQ_MASK: usize = (1 << 32) - 1;
 
     let elsr: u64 = read_sysreg!(ich_elrsr_el2);
-    let vtr = read_sysreg!(ich_vtr_el2) as usize;
-    let lr_num: usize = (vtr & 0xf) + 1;
+    let lr_num = list_regs_num();
     let mut free_ir = -1 as isize;
     for i in 0..lr_num {
         // find a free list register

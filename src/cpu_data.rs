@@ -14,7 +14,8 @@
 // Authors:
 //
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicU64;
+use core::fmt::{Debug, Formatter, Result};
+use core::sync::atomic::{fence, AtomicU64, AtomicU8, Ordering};
 use spin::Mutex;
 
 use crate::arch::{
@@ -24,6 +25,7 @@ use crate::arch::{
 use crate::consts::{INVALID_ADDRESS, PER_CPU_ARRAY_PTR, PER_CPU_SIZE};
 use crate::memory::addr::VirtAddr;
 use crate::zone::Zone;
+use crate::ENTERED_CPUS;
 
 const GUEST_IRQ_WORD_BITS: usize = u64::BITS as usize;
 const GUEST_IRQ_WORDS: usize = (crate::config::CONFIG_MAX_INTERRUPTS + 63) / 64;
@@ -33,7 +35,7 @@ const GUEST_IRQ_WORDS: usize = (crate::config::CONFIG_MAX_INTERRUPTS + 63) / 64;
 /// Bits are guest INTIDs directly. Architecture-specific LR metadata remains
 /// in `ArchVcpu`; this state is the common producer/consumer contract.
 pub struct GuestCpuIrqState {
-    pub pending: [AtomicU64; GUEST_IRQ_WORDS],
+    pending: [AtomicU64; GUEST_IRQ_WORDS],
 }
 
 impl GuestCpuIrqState {
@@ -48,10 +50,8 @@ impl GuestCpuIrqState {
         if irq_id >= crate::config::CONFIG_MAX_INTERRUPTS {
             return false;
         }
-        self.pending[irq_id / GUEST_IRQ_WORD_BITS].fetch_or(
-            1u64 << (irq_id % GUEST_IRQ_WORD_BITS),
-            core::sync::atomic::Ordering::Release,
-        );
+        self.pending[irq_id / GUEST_IRQ_WORD_BITS]
+            .fetch_or(1u64 << (irq_id % GUEST_IRQ_WORD_BITS), Ordering::Release);
         true
     }
 
@@ -59,16 +59,14 @@ impl GuestCpuIrqState {
         if irq_id >= crate::config::CONFIG_MAX_INTERRUPTS {
             return false;
         }
-        self.pending[irq_id / GUEST_IRQ_WORD_BITS].fetch_and(
-            !(1u64 << (irq_id % GUEST_IRQ_WORD_BITS)),
-            core::sync::atomic::Ordering::AcqRel,
-        );
+        self.pending[irq_id / GUEST_IRQ_WORD_BITS]
+            .fetch_and(!(1u64 << (irq_id % GUEST_IRQ_WORD_BITS)), Ordering::AcqRel);
         true
     }
 
     pub fn clear_all(&self) {
         for word in &self.pending {
-            word.store(0, core::sync::atomic::Ordering::Release);
+            word.store(0, Ordering::Release);
         }
     }
 
@@ -81,16 +79,13 @@ impl GuestCpuIrqState {
         let mut value = self
             .pending
             .get(word)
-            .map(|pending| pending.load(core::sync::atomic::Ordering::Acquire) >> offset)
+            .map(|pending| pending.load(Ordering::Acquire) >> offset)
             .unwrap_or(0);
         if offset != 0 {
             value |= self
                 .pending
                 .get(word + 1)
-                .map(|pending| {
-                    pending.load(core::sync::atomic::Ordering::Acquire)
-                        << (GUEST_IRQ_WORD_BITS - offset)
-                })
+                .map(|pending| pending.load(Ordering::Acquire) << (GUEST_IRQ_WORD_BITS - offset))
                 .unwrap_or(0);
         }
         if count == GUEST_IRQ_WORD_BITS {
@@ -104,19 +99,14 @@ impl GuestCpuIrqState {
     pub fn claim_pending_intid(&self, word_index: usize) -> Option<usize> {
         let word = self.pending.get(word_index)?;
         loop {
-            let old = word.load(core::sync::atomic::Ordering::Acquire);
+            let old = word.load(Ordering::Acquire);
             if old == 0 {
                 return None;
             }
             let bit = old.trailing_zeros() as usize;
             let mask = 1u64 << bit;
             if word
-                .compare_exchange(
-                    old,
-                    old & !mask,
-                    core::sync::atomic::Ordering::AcqRel,
-                    core::sync::atomic::Ordering::Acquire,
-                )
+                .compare_exchange(old, old & !mask, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return Some(word_index * GUEST_IRQ_WORD_BITS + bit);
@@ -127,7 +117,7 @@ impl GuestCpuIrqState {
     pub fn has_pending(&self) -> bool {
         self.pending
             .iter()
-            .any(|word| word.load(core::sync::atomic::Ordering::Acquire) != 0)
+            .any(|word| word.load(Ordering::Acquire) != 0)
     }
 
     /// Claim pending INTIDs and let the controller adapter install each one.
@@ -148,9 +138,6 @@ impl GuestCpuIrqState {
         false
     }
 }
-use crate::ENTERED_CPUS;
-use core::fmt::{Debug, Formatter, Result};
-use core::sync::atomic::{AtomicU8, Ordering};
 
 // global_asm!(include_str!("./arch/aarch64/page_table.S"),);
 
@@ -247,6 +234,16 @@ impl Vcpu {
         }
     }
 
+    /// Mark `Running` before guest entry. The fence pairs with `kick_vcpu()`
+    /// so a posted IRQ is never missed.
+    pub fn set_running(&self) {
+        self.state.store(VcpuState::Running);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Drop the pending bitmap and architecture-private IRQ state. Call with
+    /// the pCPU's `ctrl_lock` held, on zone shutdown or before handing a
+    /// stopped vCPU to a zone.
     pub fn clear_irq_state(&self) {
         self.irq.clear_all();
         self.arch.clear_irq_state();
@@ -346,7 +343,7 @@ pub fn vcpu_suspend() {
         core::hint::spin_loop();
     }
     // Remote sets `Ready` to leave Blocked; this hart then marks itself `Running` again.
-    this_cpu_data().vcpu.state.store(VcpuState::Running);
+    this_cpu_data().vcpu.set_running();
     info!("cpu {} resumed from suspend.", this_cpu_data().id);
 }
 

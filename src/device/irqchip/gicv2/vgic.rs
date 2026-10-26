@@ -380,7 +380,7 @@ fn handle_gicd_intid_pending_access(
     }
     let target_cpu = this_cpu_id();
     if mmio.is_write {
-        let mut reg = PendingR0(mmio.value as u32);
+        let mut reg = PendingR0::from_raw(mmio.value as u32);
         let sgis = reg.sgis();
         for irq_id in 0..GICV2_SGIS_NUM {
             if !sgis.get_bit(irq_id) {
@@ -394,7 +394,7 @@ fn handle_gicd_intid_pending_access(
         }
         // Forward only the physical PPI bits owned by this zone.
         reg.set_sgis(0);
-        mmio.value = (reg.0 & zone_owned_ppi_mask()) as usize;
+        mmio.value = (reg.raw() & zone_owned_ppi_mask()) as usize;
         mmio_perform_access(gicd_base, mmio);
         return Ok(());
     }
@@ -407,9 +407,9 @@ fn handle_gicd_intid_pending_access(
         }
     }
     // Hide host-owned PPI pending state, then overlay the software SGI state.
-    let mut reg = PendingR0(mmio.value as u32 & zone_owned_ppi_mask());
+    let mut reg = PendingR0::from_raw(mmio.value as u32 & zone_owned_ppi_mask());
     reg.set_sgis(sgi_pending as u16);
-    mmio.value = reg.0 as usize;
+    mmio.value = reg.raw() as usize;
     Ok(())
 }
 
@@ -430,6 +430,10 @@ pub fn vgicv2_dist_handler(mmio: &mut MMIOAccess, _arg: usize) -> HvResult {
         reg if reg == GICD_SGIR_REG_OFFSET => {
             if !mmio.is_write {
                 return Ok(());
+            }
+            // GICD_SGIR only supports aligned 32-bit writes.
+            if mmio.size != GICV2_REG_WIDTH || mmio.address % GICV2_REG_WIDTH != 0 {
+                return ignore_unsupported_gicd_access(mmio);
             }
             crate::arch::ipi::handle_guest_sgir(mmio.value as u32);
             Ok(())

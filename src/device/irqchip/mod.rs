@@ -15,9 +15,13 @@
 //
 use crate::arch::zone::HvArchZoneConfig;
 use crate::config::HvZoneConfig;
-use crate::cpu_data::{get_cpu_data, this_cpu_data, GuestCpuIrqState};
+use crate::cpu_data::{get_cpu_data, this_cpu_data, GuestCpuIrqState, Vcpu, VcpuState};
 use crate::hypercall::SGI_IPI_ID;
 use crate::zone::Zone;
+use core::sync::atomic::{fence, Ordering};
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SGIS_NUM: usize = 16;
 
 #[cfg(target_arch = "loongarch64")]
 pub fn handle_virtio_irq_event() {
@@ -29,8 +33,8 @@ pub fn handle_virtio_irq_event() {
     crate::device::virtio_trampoline::handle_virtio_irq();
 }
 
-/// Synchronize posted IRQ state owned by the current vCPU.
-///
+/// Install the current vCPU's posted guest IRQs into the interrupt controller
+/// (consumer side of `post_guest_irq()`).
 #[inline]
 pub fn flush_current_guest_irqs() {
     #[cfg(all(irq_gicv2, target_arch = "aarch64"))]
@@ -50,11 +54,14 @@ pub fn flush_guest_irq_state(
     }
 }
 
-/// Publish a guest software IRQ in the target guest CPU's common pending
-/// bitmap and kick its fixed home pCPU. `source_cpu` is used only by GICv2 to
-/// reconstruct the SGI source field in the virtual LR.
+/// Post a guest software IRQ to the target vCPU and kick its pCPU.
+/// `source_cpu` is the SGI source, used only by GICv2.
 pub fn post_guest_irq(target_cpu: usize, irq_id: usize, source_cpu: Option<usize>) -> bool {
     if irq_id >= crate::config::CONFIG_MAX_INTERRUPTS {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if irq_id >= SGIS_NUM {
         return false;
     }
     let target = get_cpu_data(target_cpu);
@@ -65,16 +72,14 @@ pub fn post_guest_irq(target_cpu: usize, irq_id: usize, source_cpu: Option<usize
         return false;
     }
     #[cfg(irq_gicv2)]
-    if irq_id < 16 {
+    if irq_id < SGIS_NUM {
         let Some(source_cpu) = source_cpu.filter(|source_cpu| *source_cpu < 8) else {
             return false;
         };
         let source_bit = 1u8 << source_cpu;
         let previous_sources = target.vcpu.arch.sgi_source[irq_id]
             .fetch_or(source_bit, core::sync::atomic::Ordering::AcqRel);
-        // A repeated SGI from the same source coalesces with the occurrence
-        // already represented by the source bit, including while it is being
-        // claimed by the target CPU.
+        // A repeated SGI from the same source coalesces.
         if previous_sources & source_bit != 0 {
             return true;
         }
@@ -83,22 +88,22 @@ pub fn post_guest_irq(target_cpu: usize, irq_id: usize, source_cpu: Option<usize
         return false;
     }
     drop(control);
-    kick_vcpu(target_cpu);
+    kick_vcpu(&target.vcpu, target_cpu);
     true
 }
 
-/// Ring the host doorbell for the pCPU to which the target vCPU is pinned.
-///
-/// Current mapping is pCPU:vCPU=1:1. A local target relies on the common
-/// exit/entry flush hook and does not receive a self IPI. A future scheduler
-/// can replace `target_pcpu_id` with a resolved `VcpuTarget`.
-pub fn kick_vcpu(target_pcpu_id: usize) {
-    let target = get_cpu_data(target_pcpu_id);
-    if target.zone.is_none() || target.vcpu.state.is_stopped() {
+/// Ring the doorbell if `vcpu` may be in the guest, reading only its atomic
+/// state. The fence pairs with `Vcpu::set_running()`.
+pub fn kick_vcpu(vcpu: &Vcpu, target_pcpu_id: usize) {
+    if target_pcpu_id == this_cpu_data().id {
         return;
     }
-    if target_pcpu_id != this_cpu_data().id {
-        crate::arch::ipi::arch_send_event(target_pcpu_id as u64, SGI_IPI_ID);
+    fence(Ordering::SeqCst);
+    match vcpu.state.load() {
+        VcpuState::Running | VcpuState::Blocked => {
+            crate::arch::ipi::arch_send_event(target_pcpu_id as u64, SGI_IPI_ID);
+        }
+        VcpuState::Ready | VcpuState::Stopped => {}
     }
 }
 
@@ -117,14 +122,21 @@ pub use gicv3::{
     gicd::set_ispender, inject_irq, percpu_init, primary_init_early, primary_init_late,
 };
 
-/// A GICD/GICR ISPENDR0 or ICPENDR0 value: SGIs in bits [15:0], PPIs in
-/// bits [31:16].
+/// ISPENDR0/ICPENDR0 value: SGIs in bits [15:0], PPIs in bits [31:16].
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
-pub(crate) struct PendingR0(pub u32);
+pub(crate) struct PendingR0(u32);
 
 #[cfg(target_arch = "aarch64")]
 impl PendingR0 {
+    pub fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
     pub fn sgis(self) -> u16 {
         bit_field::BitField::get_bits(&self.0, 0..16) as u16
     }
