@@ -24,11 +24,9 @@ pub struct ArchVcpu {
 
 impl ArchVcpu {
     pub const fn new() -> Self {
-        #[cfg(irq_gicv2)]
-        const ZERO_SOURCE: AtomicU8 = AtomicU8::new(0);
         Self {
             #[cfg(irq_gicv2)]
-            sgi_source: [ZERO_SOURCE; 16],
+            sgi_source: [const { AtomicU8::new(0) }; 16],
         }
     }
 

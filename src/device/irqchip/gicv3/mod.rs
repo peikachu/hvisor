@@ -16,6 +16,7 @@
 
 #![allow(dead_code)]
 pub mod gicd;
+pub mod gich;
 pub mod gicr;
 pub mod gits;
 pub mod msix_backend;
@@ -33,6 +34,7 @@ use gits::gits_init;
 use spin::{Lazy, Mutex, Once};
 
 use self::gicd::{enable_gic_are_ns, GICD_ICACTIVER, GICD_ICENABLER};
+use self::gich::{list_regs_num, read_lr, write_lr, IchLr, ICH_HCR_UIE};
 use self::gicr::{enable_ipi, GICR_BASE_LAYOUT};
 use crate::arch::aarch64::sysreg::{read_sysreg, smc_arg1, write_sysreg};
 use crate::arch::cpu::this_cpu_id;
@@ -46,8 +48,6 @@ use crate::device::irqchip::gicv3::gits::gits_reset;
 use crate::event::{check_events, dispatch_host_events};
 use crate::hypercall::SGI_IPI_ID;
 use crate::zone::Zone;
-
-const ICH_HCR_UIE: u64 = 1 << 1;
 
 //TODO: add Distributor init
 pub fn gicc_init() {
@@ -159,51 +159,6 @@ pub fn gicv3_handle_irq_el1() {
     trace!("handle done")
 }
 
-/// An ICH_LR<n>_EL2 value.
-#[derive(Clone, Copy)]
-struct IchLr(u64);
-
-impl IchLr {
-    fn new_pending(vintid: usize) -> Self {
-        let mut lr = Self(0);
-        lr.0.set_bits(0..32, vintid as u64);
-        lr.0.set_bit(60, true);
-        lr.set_pending(true);
-        lr
-    }
-
-    fn read(index: usize) -> Self {
-        Self(read_lr(index))
-    }
-
-    fn write(self, index: usize) {
-        write_lr(index, self.0);
-    }
-
-    fn vintid(self) -> usize {
-        self.0.get_bits(0..32) as usize
-    }
-
-    fn is_pending(self) -> bool {
-        self.0.get_bit(62)
-    }
-
-    fn set_pending(&mut self, pending: bool) {
-        self.0.set_bit(62, pending);
-    }
-
-    fn is_active(self) -> bool {
-        self.0.get_bit(63)
-    }
-}
-
-/// Number of implemented List registers; ICH_VTR_EL2.ListRegs[4:0] holds
-/// that number minus one. GICv3 defines at most 16 (`ICH_LR0..15_EL2`),
-/// which is also all `read_lr()`/`write_lr()` can reach.
-fn list_regs_num() -> usize {
-    (read_sysreg!(ich_vtr_el2).get_bits(0..5) as usize + 1).min(16)
-}
-
 pub fn clear_guest_sgi(target_cpu: usize, irq_id: usize) -> bool {
     if irq_id >= SGIS_NUM {
         return false;
@@ -312,59 +267,6 @@ fn deactivate_irq(irq_id: usize) {
     write_sysreg!(icc_eoir1_el1, irq_id as u64);
     if irq_id < 16 || irq_id == 25 {
         write_sysreg!(icc_dir_el1, irq_id as u64);
-    }
-}
-
-fn read_lr(id: usize) -> u64 {
-    let id = id as u64;
-    match id {
-        //TODO get lr size from gic reg
-        0 => read_sysreg!(ich_lr0_el2),
-        1 => read_sysreg!(ich_lr1_el2),
-        2 => read_sysreg!(ich_lr2_el2),
-        3 => read_sysreg!(ich_lr3_el2),
-        4 => read_sysreg!(ich_lr4_el2),
-        5 => read_sysreg!(ich_lr5_el2),
-        6 => read_sysreg!(ich_lr6_el2),
-        7 => read_sysreg!(ich_lr7_el2),
-        8 => read_sysreg!(ich_lr8_el2),
-        9 => read_sysreg!(ich_lr9_el2),
-        10 => read_sysreg!(ich_lr10_el2),
-        11 => read_sysreg!(ich_lr11_el2),
-        12 => read_sysreg!(ich_lr12_el2),
-        13 => read_sysreg!(ich_lr13_el2),
-        14 => read_sysreg!(ich_lr14_el2),
-        15 => read_sysreg!(ich_lr15_el2),
-        _ => {
-            error!("lr over");
-            loop {}
-        }
-    }
-}
-
-fn write_lr(id: usize, val: u64) {
-    let id = id as u64;
-    match id {
-        0 => write_sysreg!(ich_lr0_el2, val),
-        1 => write_sysreg!(ich_lr1_el2, val),
-        2 => write_sysreg!(ich_lr2_el2, val),
-        3 => write_sysreg!(ich_lr3_el2, val),
-        4 => write_sysreg!(ich_lr4_el2, val),
-        5 => write_sysreg!(ich_lr5_el2, val),
-        6 => write_sysreg!(ich_lr6_el2, val),
-        7 => write_sysreg!(ich_lr7_el2, val),
-        8 => write_sysreg!(ich_lr8_el2, val),
-        9 => write_sysreg!(ich_lr9_el2, val),
-        10 => write_sysreg!(ich_lr10_el2, val),
-        11 => write_sysreg!(ich_lr11_el2, val),
-        12 => write_sysreg!(ich_lr12_el2, val),
-        13 => write_sysreg!(ich_lr13_el2, val),
-        14 => write_sysreg!(ich_lr14_el2, val),
-        15 => write_sysreg!(ich_lr15_el2, val),
-        _ => {
-            error!("lr over");
-            loop {}
-        }
     }
 }
 

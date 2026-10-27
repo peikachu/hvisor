@@ -21,7 +21,7 @@ use super::cpu::GeneralRegisters;
 use crate::arch::sysreg::smc_call;
 use crate::zone::zone_error;
 use crate::{
-    arch::{cpu::mpidr_to_cpuid, sysreg::read_sysreg},
+    arch::{cpu::mpidr_to_cpuid, ipi, sysreg::read_sysreg},
     cpu_data::{get_cpu_data, this_cpu_data, this_zone, VcpuState},
     device::irqchip::gic_handle_irq,
     event::{send_event, IPI_EVENT_SHUTDOWN, IPI_EVENT_WAKEUP},
@@ -343,7 +343,7 @@ fn handle_sysreg(regs: &mut GeneralRegisters) {
             trace!("skip send sgi {:#x?}", sgi_id);
         } else {
             trace!("post guest sgi {:#x?}", sgi_id);
-            crate::arch::ipi::handle_guest_sgi1r(val);
+            ipi::handle_guest_sgi1r(val);
         }
         arch_skip_instruction(regs); //skip sgi write
     } else {

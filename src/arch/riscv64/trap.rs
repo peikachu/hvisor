@@ -407,6 +407,9 @@ pub fn handle_timer_interrupt(_current_cpu: &mut ArchCpu) {
 
 /// Handle supervisor software interrupt.
 pub fn handle_software_interrupt(_current_cpu: &mut ArchCpu) {
+    // Clear SSIP before draining the event queue. A concurrent producer either
+    // has its event drained by this dispatch or leaves SSIP pending for the
+    // next one; clearing after the drain could drop its notification.
     unsafe {
         riscv::register::sip::clear_ssoft();
     }

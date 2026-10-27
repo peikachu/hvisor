@@ -40,9 +40,8 @@ pub struct GuestCpuIrqState {
 
 impl GuestCpuIrqState {
     pub const fn new() -> Self {
-        const ZERO_WORD: AtomicU64 = AtomicU64::new(0);
         Self {
-            pending: [ZERO_WORD; GUEST_IRQ_WORDS],
+            pending: [const { AtomicU64::new(0) }; GUEST_IRQ_WORDS],
         }
     }
 
@@ -255,7 +254,8 @@ pub struct PerCpu {
     pub id: usize,
     pub cpu_on_entry: usize,
     pub dtb_ipa: usize,
-    /// Current pCPU:vCPU=1:1 temporary colocation; move out for fixed 1:N.
+    // Currently each pCPU is bound to exactly one vCPU (temporary 1:1 mapping).
+    // TODO: Move the vCPU out of PerCpu once fixed 1:N binding is supported.
     pub vcpu: Vcpu,
     pub arch_cpu: ArchCpu,
     pub zone: Option<Arc<Zone>>,
