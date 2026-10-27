@@ -27,6 +27,88 @@ use crate::memory::addr::VirtAddr;
 use crate::zone::Zone;
 use crate::ENTERED_CPUS;
 
+#[repr(C)]
+pub struct PerCpu {
+    pub id: usize,
+    pub cpu_on_entry: usize,
+    pub dtb_ipa: usize,
+    // Currently each pCPU is bound to exactly one vCPU (temporary 1:1 mapping).
+    // TODO: Move the vCPU out of PerCpu once fixed 1:N binding is supported.
+    pub vcpu: Vcpu,
+    pub arch_cpu: ArchCpu,
+    pub zone: Option<Arc<Zone>>,
+    pub ctrl_lock: Mutex<()>,
+    pub boot_cpu: bool,
+    // percpu stack
+}
+
+impl PerCpu {
+    pub fn new<'a>(cpu_id: usize) -> &'static mut PerCpu {
+        let arch_cpu = ArchCpu::new(cpu_id);
+        let vaddr = PER_CPU_ARRAY_PTR as VirtAddr + arch_cpu.cpuid as usize * PER_CPU_SIZE;
+        let ret = vaddr as *mut Self;
+        unsafe {
+            ret.write_volatile(PerCpu {
+                id: arch_cpu.cpuid,
+                cpu_on_entry: INVALID_ADDRESS,
+                dtb_ipa: INVALID_ADDRESS,
+                vcpu: Vcpu::new(),
+                arch_cpu,
+                zone: None,
+                ctrl_lock: Mutex::new(()),
+                boot_cpu: false,
+            })
+        };
+        unsafe {
+            let pointer = &ret.as_mut().unwrap().arch_cpu as *const _ as usize;
+            store_cpu_pointer_to_reg(pointer);
+        }
+        // #[cfg(target_arch = "riscv64")]
+        // {
+        //     use crate::arch::csr::{write_csr, CSR_SSCRATCH};
+        //     write_csr!(
+        //         CSR_SSCRATCH,
+        //         &ret.as_mut().unwrap().arch_cpu as *const _ as usize
+        //     ); //arch cpu pointer
+        // }
+        unsafe { ret.as_mut().unwrap() }
+    }
+
+    pub fn run_vm(&mut self) {
+        if !self.boot_cpu {
+            info!("CPU{}: Idling the CPU before starting VM...", self.id);
+            self.arch_cpu.idle();
+        }
+        info!("CPU{}: Running the VM...", self.id);
+        self.arch_cpu.run();
+    }
+
+    pub fn entered_cpus() -> u32 {
+        ENTERED_CPUS.load(Ordering::Acquire)
+    }
+
+    pub fn activate_gpm(&self) {
+        unsafe {
+            self.zone.clone().unwrap().read().gpm().activate();
+        }
+    }
+}
+
+pub fn get_cpu_data<'a>(cpu_id: usize) -> &'a mut PerCpu {
+    let cpu_data: usize = PER_CPU_ARRAY_PTR as VirtAddr + cpu_id as usize * PER_CPU_SIZE;
+    unsafe { &mut *(cpu_data as *mut PerCpu) }
+}
+
+pub fn this_cpu_data<'a>() -> &'a mut PerCpu {
+    // Note: this_cpu_id() should return logical cpu_id 0..BOARD_NCPUS
+    get_cpu_data(this_cpu_id())
+}
+
+#[allow(unused)]
+pub fn this_zone() -> Arc<Zone> {
+    this_cpu_data().zone.clone().unwrap()
+}
+
 /// Per-vCPU state: lifecycle, posted guest IRQs and architecture-private data.
 //
 // Temporarily colocated with its pinned host pCPU. This object, including its
@@ -251,87 +333,6 @@ impl GuestCpuIrqState {
     }
 }
 
-#[repr(C)]
-pub struct PerCpu {
-    pub id: usize,
-    pub cpu_on_entry: usize,
-    pub dtb_ipa: usize,
-    // Currently each pCPU is bound to exactly one vCPU (temporary 1:1 mapping).
-    // TODO: Move the vCPU out of PerCpu once fixed 1:N binding is supported.
-    pub vcpu: Vcpu,
-    pub arch_cpu: ArchCpu,
-    pub zone: Option<Arc<Zone>>,
-    pub ctrl_lock: Mutex<()>,
-    pub boot_cpu: bool,
-    // percpu stack
-}
-
-impl PerCpu {
-    pub fn new<'a>(cpu_id: usize) -> &'static mut PerCpu {
-        let arch_cpu = ArchCpu::new(cpu_id);
-        let vaddr = PER_CPU_ARRAY_PTR as VirtAddr + arch_cpu.cpuid as usize * PER_CPU_SIZE;
-        let ret = vaddr as *mut Self;
-        unsafe {
-            ret.write_volatile(PerCpu {
-                id: arch_cpu.cpuid,
-                cpu_on_entry: INVALID_ADDRESS,
-                dtb_ipa: INVALID_ADDRESS,
-                vcpu: Vcpu::new(),
-                arch_cpu,
-                zone: None,
-                ctrl_lock: Mutex::new(()),
-                boot_cpu: false,
-            })
-        };
-        unsafe {
-            let pointer = &ret.as_mut().unwrap().arch_cpu as *const _ as usize;
-            store_cpu_pointer_to_reg(pointer);
-        }
-        // #[cfg(target_arch = "riscv64")]
-        // {
-        //     use crate::arch::csr::{write_csr, CSR_SSCRATCH};
-        //     write_csr!(
-        //         CSR_SSCRATCH,
-        //         &ret.as_mut().unwrap().arch_cpu as *const _ as usize
-        //     ); //arch cpu pointer
-        // }
-        unsafe { ret.as_mut().unwrap() }
-    }
-
-    pub fn run_vm(&mut self) {
-        if !self.boot_cpu {
-            info!("CPU{}: Idling the CPU before starting VM...", self.id);
-            self.arch_cpu.idle();
-        }
-        info!("CPU{}: Running the VM...", self.id);
-        self.arch_cpu.run();
-    }
-
-    pub fn entered_cpus() -> u32 {
-        ENTERED_CPUS.load(Ordering::Acquire)
-    }
-
-    pub fn activate_gpm(&self) {
-        unsafe {
-            self.zone.clone().unwrap().read().gpm().activate();
-        }
-    }
-}
-
-pub fn get_cpu_data<'a>(cpu_id: usize) -> &'a mut PerCpu {
-    let cpu_data: usize = PER_CPU_ARRAY_PTR as VirtAddr + cpu_id as usize * PER_CPU_SIZE;
-    unsafe { &mut *(cpu_data as *mut PerCpu) }
-}
-
-pub fn this_cpu_data<'a>() -> &'a mut PerCpu {
-    // Note: this_cpu_id() should return logical cpu_id 0..BOARD_NCPUS
-    get_cpu_data(this_cpu_id())
-}
-
-#[allow(unused)]
-pub fn this_zone() -> Arc<Zone> {
-    this_cpu_data().zone.clone().unwrap()
-}
 /// Enter blocked state and wait until another CPU resumes it.
 #[allow(unused)]
 pub fn vcpu_suspend() {
