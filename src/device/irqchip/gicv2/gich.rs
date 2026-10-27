@@ -15,12 +15,12 @@
 //    Hangqi Ren <2572131118@qq.com>
 #![allow(unused_variables)]
 #![allow(dead_code)]
+/// gich layout definition and functions for gich operations.
+/// author : ForeverYolo
 use crate::device::irqchip::gicv2::gic_ref::GicRef;
 use crate::device::irqchip::gicv2::GICV2;
 use bit_field::BitField;
 use spin::Once;
-/// gich layout definition and functions for gich operations.
-/// author : ForeverYolo
 use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::register_structs;
 use tock_registers::registers::{ReadOnly, ReadWrite};

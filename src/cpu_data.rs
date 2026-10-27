@@ -27,114 +27,40 @@ use crate::memory::addr::VirtAddr;
 use crate::zone::Zone;
 use crate::ENTERED_CPUS;
 
-const GUEST_IRQ_WORD_BITS: usize = u64::BITS as usize;
-const GUEST_IRQ_WORDS: usize = (crate::config::CONFIG_MAX_INTERRUPTS + 63) / 64;
-
-/// Pending software IRQ state owned by one guest CPU.
-///
-/// Bits are guest INTIDs directly. Architecture-specific LR metadata remains
-/// in `ArchVcpu`; this state is the common producer/consumer contract.
-pub struct GuestCpuIrqState {
-    pending: [AtomicU64; GUEST_IRQ_WORDS],
+/// Per-vCPU state: lifecycle, posted guest IRQs and architecture-private data.
+//
+// Temporarily colocated with its pinned host pCPU. This object, including its
+// `arch` member, is the unit that can later move out of `PerCpu` when fixed
+// 1:N vCPU scheduling returns.
+pub struct Vcpu {
+    pub state: VcpuStateCell,
+    pub irq: GuestCpuIrqState,
+    pub arch: ArchVcpu,
 }
 
-impl GuestCpuIrqState {
+impl Vcpu {
     pub const fn new() -> Self {
         Self {
-            pending: [const { AtomicU64::new(0) }; GUEST_IRQ_WORDS],
+            state: VcpuStateCell::new(VcpuState::Stopped),
+            irq: GuestCpuIrqState::new(),
+            arch: ArchVcpu::new(),
         }
     }
 
-    pub fn set(&self, irq_id: usize) -> bool {
-        if irq_id >= crate::config::CONFIG_MAX_INTERRUPTS {
-            return false;
-        }
-        self.pending[irq_id / GUEST_IRQ_WORD_BITS]
-            .fetch_or(1u64 << (irq_id % GUEST_IRQ_WORD_BITS), Ordering::Release);
-        true
+    /// Mark `Running` before guest entry.
+    //
+    // The fence pairs with `kick_vcpu()` so a posted IRQ is never missed.
+    pub fn set_running(&self) {
+        self.state.store(VcpuState::Running);
+        fence(Ordering::SeqCst);
     }
 
-    pub fn clear(&self, irq_id: usize) -> bool {
-        if irq_id >= crate::config::CONFIG_MAX_INTERRUPTS {
-            return false;
-        }
-        self.pending[irq_id / GUEST_IRQ_WORD_BITS]
-            .fetch_and(!(1u64 << (irq_id % GUEST_IRQ_WORD_BITS)), Ordering::AcqRel);
-        true
-    }
-
-    pub fn clear_all(&self) {
-        for word in &self.pending {
-            word.store(0, Ordering::Release);
-        }
-    }
-
-    pub fn pending_mask(&self, first_irq: usize, count: usize) -> u64 {
-        if count == 0 || count > GUEST_IRQ_WORD_BITS {
-            return 0;
-        }
-        let word = first_irq / GUEST_IRQ_WORD_BITS;
-        let offset = first_irq % GUEST_IRQ_WORD_BITS;
-        let mut value = self
-            .pending
-            .get(word)
-            .map(|pending| pending.load(Ordering::Acquire) >> offset)
-            .unwrap_or(0);
-        if offset != 0 {
-            value |= self
-                .pending
-                .get(word + 1)
-                .map(|pending| pending.load(Ordering::Acquire) << (GUEST_IRQ_WORD_BITS - offset))
-                .unwrap_or(0);
-        }
-        if count == GUEST_IRQ_WORD_BITS {
-            value
-        } else {
-            value & ((1u64 << count) - 1)
-        }
-    }
-
-    /// Atomically claim the lowest pending INTID in one bitmap word.
-    pub fn claim_pending_intid(&self, word_index: usize) -> Option<usize> {
-        let word = self.pending.get(word_index)?;
-        loop {
-            let old = word.load(Ordering::Acquire);
-            if old == 0 {
-                return None;
-            }
-            let bit = old.trailing_zeros() as usize;
-            let mask = 1u64 << bit;
-            if word
-                .compare_exchange(old, old & !mask, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some(word_index * GUEST_IRQ_WORD_BITS + bit);
-            }
-        }
-    }
-
-    pub fn has_pending(&self) -> bool {
-        self.pending
-            .iter()
-            .any(|word| word.load(Ordering::Acquire) != 0)
-    }
-
-    /// Claim pending INTIDs and let the controller adapter install each one.
-    ///
-    /// The adapter owns INTID classes and LR encoding. Returning `false` means
-    /// the adapter could not install the claimed INTID, so this helper puts it
-    /// back and reports that maintenance must remain armed.
-    pub fn flush_pending_with(&self, mut install: impl FnMut(usize) -> bool) -> bool {
-        for word_index in 0..self.pending.len() {
-            while let Some(irq_id) = self.claim_pending_intid(word_index) {
-                if install(irq_id) {
-                    continue;
-                }
-                self.set(irq_id);
-                return true;
-            }
-        }
-        false
+    /// Drop the pending bitmap and architecture-private IRQ state. Call with
+    /// the pCPU's `ctrl_lock` held, on zone shutdown or before handing a
+    /// stopped vCPU to a zone.
+    pub fn clear_irq_state(&self) {
+        self.irq.clear_all();
+        self.arch.clear_irq_state();
     }
 }
 
@@ -214,38 +140,114 @@ impl Debug for VcpuStateCell {
     }
 }
 
-/// vCPU state temporarily colocated with its pinned host pCPU.
-///
-/// This object, including its architecture-private `arch` member, is the unit
-/// that can later move out of `PerCpu` when fixed 1:N vCPU scheduling returns.
-pub struct Vcpu {
-    pub state: VcpuStateCell,
-    pub irq: GuestCpuIrqState,
-    pub arch: ArchVcpu,
+const GUEST_IRQ_WORD_BITS: usize = u64::BITS as usize;
+const GUEST_IRQ_WORDS: usize = (crate::config::CONFIG_MAX_INTERRUPTS + 63) / 64;
+
+/// Pending software IRQ state owned by one guest CPU. Bits are guest INTIDs.
+//
+// Architecture-specific LR metadata remains in `ArchVcpu`; this state is the
+// common producer/consumer contract.
+pub struct GuestCpuIrqState {
+    pending: [AtomicU64; GUEST_IRQ_WORDS],
 }
 
-impl Vcpu {
+impl GuestCpuIrqState {
     pub const fn new() -> Self {
         Self {
-            state: VcpuStateCell::new(VcpuState::Stopped),
-            irq: GuestCpuIrqState::new(),
-            arch: ArchVcpu::new(),
+            pending: [const { AtomicU64::new(0) }; GUEST_IRQ_WORDS],
         }
     }
 
-    /// Mark `Running` before guest entry. The fence pairs with `kick_vcpu()`
-    /// so a posted IRQ is never missed.
-    pub fn set_running(&self) {
-        self.state.store(VcpuState::Running);
-        fence(Ordering::SeqCst);
+    pub fn set(&self, irq_id: usize) -> bool {
+        if irq_id >= crate::config::CONFIG_MAX_INTERRUPTS {
+            return false;
+        }
+        self.pending[irq_id / GUEST_IRQ_WORD_BITS]
+            .fetch_or(1u64 << (irq_id % GUEST_IRQ_WORD_BITS), Ordering::Release);
+        true
     }
 
-    /// Drop the pending bitmap and architecture-private IRQ state. Call with
-    /// the pCPU's `ctrl_lock` held, on zone shutdown or before handing a
-    /// stopped vCPU to a zone.
-    pub fn clear_irq_state(&self) {
-        self.irq.clear_all();
-        self.arch.clear_irq_state();
+    /// Claim pending INTIDs and let the controller adapter install each one.
+    /// Returns `true` when `install` refused an INTID; that INTID is put back
+    /// and maintenance must stay armed.
+    //
+    // The adapter owns INTID classes and LR encoding.
+    pub fn flush_pending_with(&self, mut install: impl FnMut(usize) -> bool) -> bool {
+        for word_index in 0..self.pending.len() {
+            while let Some(irq_id) = self.claim_pending_intid(word_index) {
+                if install(irq_id) {
+                    continue;
+                }
+                self.set(irq_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Atomically claim the lowest pending INTID in one bitmap word.
+    pub fn claim_pending_intid(&self, word_index: usize) -> Option<usize> {
+        let word = self.pending.get(word_index)?;
+        loop {
+            let old = word.load(Ordering::Acquire);
+            if old == 0 {
+                return None;
+            }
+            let bit = old.trailing_zeros() as usize;
+            let mask = 1u64 << bit;
+            if word
+                .compare_exchange(old, old & !mask, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(word_index * GUEST_IRQ_WORD_BITS + bit);
+            }
+        }
+    }
+
+    pub fn clear(&self, irq_id: usize) -> bool {
+        if irq_id >= crate::config::CONFIG_MAX_INTERRUPTS {
+            return false;
+        }
+        self.pending[irq_id / GUEST_IRQ_WORD_BITS]
+            .fetch_and(!(1u64 << (irq_id % GUEST_IRQ_WORD_BITS)), Ordering::AcqRel);
+        true
+    }
+
+    pub fn clear_all(&self) {
+        for word in &self.pending {
+            word.store(0, Ordering::Release);
+        }
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|word| word.load(Ordering::Acquire) != 0)
+    }
+
+    pub fn pending_mask(&self, first_irq: usize, count: usize) -> u64 {
+        if count == 0 || count > GUEST_IRQ_WORD_BITS {
+            return 0;
+        }
+        let word = first_irq / GUEST_IRQ_WORD_BITS;
+        let offset = first_irq % GUEST_IRQ_WORD_BITS;
+        let mut value = self
+            .pending
+            .get(word)
+            .map(|pending| pending.load(Ordering::Acquire) >> offset)
+            .unwrap_or(0);
+        if offset != 0 {
+            value |= self
+                .pending
+                .get(word + 1)
+                .map(|pending| pending.load(Ordering::Acquire) << (GUEST_IRQ_WORD_BITS - offset))
+                .unwrap_or(0);
+        }
+        if count == GUEST_IRQ_WORD_BITS {
+            value
+        } else {
+            value & ((1u64 << count) - 1)
+        }
     }
 }
 

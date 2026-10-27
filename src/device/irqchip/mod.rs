@@ -33,27 +33,6 @@ pub fn handle_virtio_irq_event() {
     crate::device::virtio_trampoline::handle_virtio_irq();
 }
 
-/// Install the current vCPU's posted guest IRQs into the interrupt controller
-/// (consumer side of `post_guest_irq()`).
-#[inline]
-pub fn flush_current_guest_irqs() {
-    #[cfg(all(irq_gicv2, target_arch = "aarch64"))]
-    gicv2::gic::flush_current_guest_irqs();
-    #[cfg(all(irq_gicv3, target_arch = "aarch64"))]
-    gicv3::flush_current_guest_irqs();
-}
-
-/// Run the controller-independent pending claim/retry flow.
-pub fn flush_guest_irq_state(
-    state: &GuestCpuIrqState,
-    install: impl FnMut(usize) -> bool,
-    rearm_maintenance: impl FnOnce(),
-) {
-    if state.flush_pending_with(install) {
-        rearm_maintenance();
-    }
-}
-
 /// Post a guest software IRQ to the target vCPU and kick its pCPU.
 /// `source_cpu` is the SGI source, used only by GICv2.
 pub fn post_guest_irq(target_cpu: usize, irq_id: usize, source_cpu: Option<usize>) -> bool {
@@ -93,7 +72,9 @@ pub fn post_guest_irq(target_cpu: usize, irq_id: usize, source_cpu: Option<usize
 }
 
 /// Ring the doorbell if `vcpu` may be in the guest, reading only its atomic
-/// state. The fence pairs with `Vcpu::set_running()`.
+/// state.
+//
+// The fence pairs with `Vcpu::set_running()`.
 pub fn kick_vcpu(vcpu: &Vcpu, target_pcpu_id: usize) {
     if target_pcpu_id == this_cpu_data().id {
         return;
@@ -107,11 +88,32 @@ pub fn kick_vcpu(vcpu: &Vcpu, target_pcpu_id: usize) {
     }
 }
 
+/// Install the current vCPU's posted guest IRQs into the interrupt controller
+/// (consumer side of `post_guest_irq()`).
+#[inline]
+pub fn flush_current_guest_irqs() {
+    #[cfg(all(irq_gicv2, target_arch = "aarch64"))]
+    gicv2::lr::flush_current_guest_irqs();
+    #[cfg(all(irq_gicv3, target_arch = "aarch64"))]
+    gicv3::lr::flush_current_guest_irqs();
+}
+
+/// Run the controller-independent pending claim/retry flow.
+pub fn flush_guest_irq_state(
+    state: &GuestCpuIrqState,
+    install: impl FnMut(usize) -> bool,
+    rearm_maintenance: impl FnOnce(),
+) {
+    if state.flush_pending_with(install) {
+        rearm_maintenance();
+    }
+}
+
 #[cfg(all(irq_gicv2, target_arch = "aarch64"))]
 pub mod gicv2;
 #[cfg(all(irq_gicv2, target_arch = "aarch64"))]
 pub use gicv2::{
-    gic::inject_irq, gicd::set_ispender, percpu_init, primary_init_early, primary_init_late,
+    gicd::set_ispender, lr::inject_irq, percpu_init, primary_init_early, primary_init_late,
     vgic::set_sgi_irq,
 };
 
@@ -119,7 +121,7 @@ pub use gicv2::{
 pub mod gicv3;
 #[cfg(all(irq_gicv3, target_arch = "aarch64"))]
 pub use gicv3::{
-    gicd::set_ispender, inject_irq, percpu_init, primary_init_early, primary_init_late,
+    gicd::set_ispender, lr::inject_irq, percpu_init, primary_init_early, primary_init_late,
 };
 
 /// ISPENDR0/ICPENDR0 value: SGIs in bits [15:0], PPIs in bits [31:16].
@@ -151,7 +153,7 @@ pub fn gic_handle_irq() {
     #[cfg(irq_gicv2)]
     gicv2::gic::gicv2_handle_irq();
     #[cfg(irq_gicv3)]
-    gicv3::gicv3_handle_irq_el1();
+    gicv3::gic::gicv3_handle_irq_el1();
 }
 
 #[cfg(target_arch = "aarch64")]

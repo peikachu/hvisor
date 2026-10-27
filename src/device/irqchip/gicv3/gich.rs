@@ -13,10 +13,9 @@
 //
 // Authors:
 //
-//! GICv3 virtual CPU interface control (ICH_*_EL2) and List register values.
-use bit_field::BitField;
-
+// GICv3 virtual CPU interface control (ICH_*_EL2) and List register values.
 use crate::arch::aarch64::sysreg::{read_sysreg, write_sysreg};
+use bit_field::BitField;
 
 pub const ICH_HCR_UIE: u64 = 1 << 1;
 
@@ -58,9 +57,11 @@ impl IchLr {
     }
 }
 
-/// Number of implemented List registers; ICH_VTR_EL2.ListRegs[4:0] holds
-/// that number minus one. GICv3 defines at most 16 (`ICH_LR0..15_EL2`),
-/// which is also all `read_lr()`/`write_lr()` can reach.
+/// Number of implemented List registers.
+//
+// ICH_VTR_EL2.ListRegs[4:0] holds that number minus one. GICv3 defines at
+// most 16 (`ICH_LR0..15_EL2`), which is also all `read_lr()`/`write_lr()` can
+// reach.
 pub fn list_regs_num() -> usize {
     (read_sysreg!(ich_vtr_el2).get_bits(0..5) as usize + 1).min(16)
 }

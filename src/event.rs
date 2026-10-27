@@ -41,6 +41,10 @@ pub const IPI_EVENT_VIRTIO_PCI_CONFIG: usize = 10;
 pub const IPI_EVENT_VIRTIO_PCI_DATA: usize = 11;
 pub const IPI_EVENT_VIRTIO_PCI_DONE: usize = 12;
 
+// Legacy per-CPU event FIFO, used by `send_event()` and drained through
+// `check_events()`/`handle_next_event()`.
+//
+// FIXME: Remove this queue and its API once every event class has left `PERCPU_EVENTS`.
 #[percpu::def_percpu]
 static PERCPU_EVENTS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
 
@@ -173,8 +177,9 @@ pub fn check_events() -> bool {
     handle_event(fetch_event(this_cpu_data().id))
 }
 
-/// Flush posted guest IRQs, then drain the legacy `PERCPU_EVENTS` FIFO. Only
-/// the flush remains once every event class has left `PERCPU_EVENTS`.
+/// Flush posted guest IRQs, then drain the legacy `PERCPU_EVENTS` FIFO.
+//
+// FIXME: Only the flush remains once every event class has left `PERCPU_EVENTS`.
 pub fn dispatch_host_events(drain_legacy_events: impl FnOnce()) {
     crate::device::irqchip::flush_current_guest_irqs();
     drain_legacy_events();

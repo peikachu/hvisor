@@ -13,7 +13,7 @@
 //
 // Authors:
 //
-/// Architecture-private vCPU state placeholder.
+// Architecture-private vCPU state placeholder.
 pub struct ArchVcpu;
 
 impl ArchVcpu {

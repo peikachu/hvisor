@@ -15,19 +15,16 @@
 //
 
 use crate::device::irqchip::gic_send_event;
-
-use bit_field::BitField;
-
 #[cfg(irq_gicv2)]
 use crate::{arch::cpu::this_cpu_id, cpu_data::this_zone};
-
 #[cfg(irq_gicv3)]
 use crate::{
     arch::cpu::{cpuid_to_mpidr_affinity, this_cpu_id},
     cpu_data::this_zone,
 };
+use bit_field::BitField;
 
-/// An ICC_SGI1R_EL1 value written by the guest.
+// An ICC_SGI1R_EL1 value written by the guest.
 #[derive(Clone, Copy)]
 struct Sgi1r(u64);
 
@@ -40,7 +37,7 @@ impl Sgi1r {
         self.0.get_bits(24..28) as usize
     }
 
-    /// Interrupt Routing Mode: target every PE except the requester.
+    // Interrupt Routing Mode: target every PE except the requester.
     fn irm(self) -> bool {
         self.0.get_bit(40)
     }
@@ -81,7 +78,7 @@ impl Sgi1r {
     }
 }
 
-/// A GICD_SGIR value written by the guest.
+// A GICD_SGIR value written by the guest.
 #[cfg(irq_gicv2)]
 #[derive(Clone, Copy)]
 struct Sgir(u32);
@@ -107,6 +104,17 @@ pub fn arch_send_event(cpu_id: u64, sgi_num: u64) {
 
 pub fn arch_notify_event(cpu_id: u64, sgi_num: u64, _event_id: usize, _queue_was_empty: bool) {
     arch_send_event(cpu_id, sgi_num);
+}
+
+pub fn arch_check_events(event: Option<usize>) {
+    match event {
+        _ => {
+            info!(
+                "aarch64: arch_check_events: event={:#x?} do nothing now",
+                event
+            );
+        }
+    }
 }
 
 #[cfg(irq_gicv3)]
@@ -151,17 +159,6 @@ fn post_guest_sgi(irq_id: usize, target_list: u8, filter: u32) {
         if selected && !crate::device::irqchip::post_guest_irq(target_cpu, irq_id, Some(source_cpu))
         {
             warn!("failed to post guest SGI {} to CPU{}", irq_id, target_cpu);
-        }
-    }
-}
-
-pub fn arch_check_events(event: Option<usize>) {
-    match event {
-        _ => {
-            info!(
-                "aarch64: arch_check_events: event={:#x?} do nothing now",
-                event
-            );
         }
     }
 }
